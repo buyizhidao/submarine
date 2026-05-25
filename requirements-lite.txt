@@ -1,0 +1,16 @@
+beautifulsoup4
+cymruwhois
+geoip2
+geopandas
+geopy
+graphqlclient
+haversine
+numpy
+pycountry
+pycountry_convert
+requests
+reverse_geocode
+scikit-learn
+selenium
+Unidecode
+urllib3
