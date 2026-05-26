@@ -6,3 +6,7 @@ data/raw/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Contrast runtime outputs. Keep contrast source scripts and README tracked.
+contrast/output/
+contrast/*.log
