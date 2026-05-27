@@ -43,17 +43,17 @@ score 分布见 `output/layer1_score_buckets.csv`，候选数量分布见 `outpu
 
 ## 第二层：Nautilus API 当前对比
 
-- 请求抽样数量：5
-- 找到可提交 traceroute 的样本：5
-- 完成 API 对比的样本：5
-- API 可提取候选海缆的样本：1
-- 提取方式统计：none: 4, geometry_inferred: 1
-- Top-1 一致率：0.00%
-- Top-3 命中率：0.00%
-- 任意候选交集率：0.00%
-- Jaccard 平均值：0.0
-- 本地空候选但 API 有候选：1
-- 本地有候选但 API 空候选：4
+- 请求抽样数量：500
+- 找到可提交 traceroute 的样本：500
+- 完成 API 对比的样本：500
+- API 可提取候选海缆的样本：424
+- 提取方式统计：none: 76, geometry_inferred: 424
+- Top-1 一致率：3.54%
+- Top-3 命中率：21.70%
+- 任意候选交集率：22.64%
+- Jaccard 平均值：0.021128
+- 本地空候选但 API 有候选：69
+- 本地有候选但 API 空候选：70
 
 逐条对比见 `output/layer2_link_comparison.csv`，API 原始响应缓存见 `output/api_cache/`。
 
