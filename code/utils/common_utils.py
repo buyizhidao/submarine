@@ -1,6 +1,7 @@
 import pickle
 from pathlib import Path
 import subprocess
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import os, sys
 sys.path.insert(1, os.path.abspath('.'))
@@ -14,7 +15,7 @@ from utils.geolocation_utils import generate_latlon_cluster_and_score_map, gener
 from utils.as_utils import generate_closest_submarine_org
 from utils.traceroute_utils import load_all_links_and_ips_data, generate_test_case_links_and_ips_data
 
-from submarine.telegeography_submarine import find_intersecting_cables, Cable, LandingPoints, get_all_latlon_locations_ball_tree, get_cable_by_cable_id
+from submarine.telegeography_submarine import Cable, LandingPoints, get_all_latlon_locations_ball_tree
 import math
 import numpy as np
 from itertools import product
@@ -23,6 +24,8 @@ from haversine import haversine, Unit
 Cable = namedtuple('Cable', ['name', 'landing_points', 'length', 'owners', 'notes', 'rfs', 'other_info'])
 
 logger = get_logger(__name__)
+
+_CABLE_MAPPING_WORKER_CONTEXT = None
 
 
 def get_cable_details():
@@ -79,6 +82,17 @@ def return_mean_and_len_clusters (ip_address, geolocation_latlon_cluster_and_sco
     return (get_sorted_mean_clusters(latlon_cluster), sorted(len_cluster, reverse=True))
 
 
+def get_cached_mean_and_len_clusters(ip_address, geolocation_latlon_cluster_and_scores_map, ip_cluster_cache=None):
+    if ip_cluster_cache is None:
+        return return_mean_and_len_clusters(ip_address, geolocation_latlon_cluster_and_scores_map)
+
+    cached = ip_cluster_cache.get(ip_address)
+    if cached is None:
+        cached = return_mean_and_len_clusters(ip_address, geolocation_latlon_cluster_and_scores_map)
+        ip_cluster_cache[ip_address] = cached
+    return cached
+
+
 
 def convert_degrees_to_randians(item):
     return tuple(map(math.radians, item))
@@ -95,9 +109,47 @@ def get_landing_point_info (tree_index, landing_points_dict, latlon_dict, latlon
 
 
 
-def get_cable_for_given_latlon_pair (latlon_pair, tree, scores_pair, future_cables, landing_points_dict, latlon_dict, latlons, category):
-    radians_latlon_pair = list(map(convert_degrees_to_randians, latlon_pair))
+def prepare_landing_point_lookup(landing_points_dict, latlon_dict, latlons):
+    landing_points_by_tree_index = []
+    landing_point_cables_by_tree_index = []
+    for latlon in latlons:
+        landing_point = landing_points_dict[latlon_dict[latlon]]
+        landing_points_by_tree_index.append(landing_point)
+        landing_point_cables_by_tree_index.append(frozenset(landing_point.cable))
+    return landing_points_by_tree_index, landing_point_cables_by_tree_index
+
+
+def _latlon_pair_cache_key(category, latlon_pair):
+    return (category, tuple(tuple(point) for point in latlon_pair))
+
+
+def _attach_scores_to_candidate_cables(candidate_cables, latlon_pair, scores_pair):
     out = {}
+    for cable, candidates in candidate_cables.items():
+        out[cable] = [
+            (latlon_pair, landing_points, scores_pair, dist_pairs)
+            for landing_points, dist_pairs in candidates
+        ]
+    return out
+
+
+def get_cable_for_given_latlon_pair (latlon_pair, tree, scores_pair, future_cables, landing_points_dict, latlon_dict, latlons, category, cable_dict=None, landing_points_by_tree_index=None, landing_point_cables_by_tree_index=None, candidate_cache=None):
+    if candidate_cache is not None:
+        cache_key = _latlon_pair_cache_key(category, latlon_pair)
+        candidate_cables = candidate_cache.get(cache_key)
+        if candidate_cables is not None:
+            return _attach_scores_to_candidate_cables(candidate_cables, latlon_pair, scores_pair)
+    else:
+        cache_key = None
+
+    if cable_dict is None:
+        cable_dict = get_cable_details()
+
+    if landing_points_by_tree_index is None or landing_point_cables_by_tree_index is None:
+        landing_points_by_tree_index, landing_point_cables_by_tree_index = prepare_landing_point_lookup(landing_points_dict, latlon_dict, latlons)
+
+    radians_latlon_pair = list(map(convert_degrees_to_randians, latlon_pair))
+    candidate_cables = {}
     radius_increase = 50
     if 'te' in category:
     	current_radius = 500
@@ -108,21 +160,23 @@ def get_cable_for_given_latlon_pair (latlon_pair, tree, scores_pair, future_cabl
         ind, dist = tuple(map(list_conversion_from_array, tree.query_radius(radians_latlon_pair, current_radius/6371, return_distance=True, sort_results=True)))
         for index_pairs, dist_pairs in zip(product(ind[0], ind[1]), product(dist[0], dist[1])):
             if index_pairs[0] != index_pairs[1]:
-                landing_point_1, landing_point_2 = get_landing_point_info(index_pairs[0], landing_points_dict, latlon_dict, latlons), get_landing_point_info(index_pairs[1], landing_points_dict, latlon_dict, latlons) 
-                cables = find_intersecting_cables(landing_point_1.cable, landing_point_2.cable)
+                landing_point_1, landing_point_2 = landing_points_by_tree_index[index_pairs[0]], landing_points_by_tree_index[index_pairs[1]]
+                cables = sorted(landing_point_cables_by_tree_index[index_pairs[0]] & landing_point_cables_by_tree_index[index_pairs[1]])
                 cables = [cable for cable in cables if cable not in future_cables]
                 if len(cables) > 0:
                     for cable in cables:
-                        identified_cable = get_cable_by_cable_id(cable).name
-                        scores_val = out.get(identified_cable, [])
-                        scores_val.append((latlon_pair, (landing_point_1, landing_point_2), scores_pair, dist_pairs))
-                        out[identified_cable] = scores_val
+                        identified_cable = cable_dict[cable].name
+                        scores_val = candidate_cables.get(identified_cable, [])
+                        scores_val.append(((landing_point_1, landing_point_2), dist_pairs))
+                        candidate_cables[identified_cable] = scores_val
                     match_count += 1
         current_radius += radius_increase
         if current_radius >= 1000:
             break
             
-    return out
+    if candidate_cache is not None:
+        candidate_cache[cache_key] = candidate_cables
+    return _attach_scores_to_candidate_cables(candidate_cables, latlon_pair, scores_pair)
 
 
 
@@ -161,6 +215,57 @@ def save_checkpoint_part(part_mapping, part_file):
 
 	part_file.parent.mkdir(parents=True, exist_ok=True)
 	save_results_to_file(part_mapping, str(part_file.parent), part_file.name)
+
+
+def _init_cable_mapping_worker(latlon_cluster_and_score_map, category, tree, future_cables, closest_submarine_org, submarine_owners_dict, cable_dict, landing_points_dict, latlon_dict, latlons):
+	global _CABLE_MAPPING_WORKER_CONTEXT
+	landing_points_by_tree_index, landing_point_cables_by_tree_index = prepare_landing_point_lookup(landing_points_dict, latlon_dict, latlons)
+	_CABLE_MAPPING_WORKER_CONTEXT = {
+	 'latlon_cluster_and_score_map': latlon_cluster_and_score_map,
+	 'category': category,
+	 'tree': tree,
+	 'future_cables': future_cables,
+	 'closest_submarine_org': closest_submarine_org,
+	 'submarine_owners_dict': submarine_owners_dict,
+	 'cable_dict': cable_dict,
+	 'landing_points_dict': landing_points_dict,
+	 'latlon_dict': latlon_dict,
+	 'latlons': latlons,
+	 'landing_points_by_tree_index': landing_points_by_tree_index,
+	 'landing_point_cables_by_tree_index': landing_point_cables_by_tree_index,
+	 'candidate_cache': {},
+	 'ip_cluster_cache': {},
+	}
+
+
+def _generate_cable_mapping_part_worker(chunk_start, chunk_links, part_file):
+	context = _CABLE_MAPPING_WORKER_CONTEXT
+	if context is None:
+		raise RuntimeError('Cable mapping worker context is not initialized')
+
+	part_mapping = {}
+	for ip_1, ip_2 in chunk_links:
+		part_mapping[(ip_1, ip_2)] = generate_cable_mapping_for_single_link(
+		 ip_1,
+		 ip_2,
+		 context['latlon_cluster_and_score_map'],
+		 context['category'],
+		 context['tree'],
+		 context['future_cables'],
+		 context['closest_submarine_org'],
+		 context['submarine_owners_dict'],
+		 context['cable_dict'],
+		 context['landing_points_dict'],
+		 context['latlon_dict'],
+		 context['latlons'],
+		 landing_points_by_tree_index=context['landing_points_by_tree_index'],
+		 landing_point_cables_by_tree_index=context['landing_point_cables_by_tree_index'],
+		 candidate_cache=context['candidate_cache'],
+		 ip_cluster_cache=context['ip_cluster_cache'],
+		)
+
+	save_checkpoint_part(part_mapping, Path(part_file))
+	return chunk_start, str(part_file), len(part_mapping)
 
 
 def is_complete_mapping_file(final_file, expected_len):
@@ -205,23 +310,31 @@ def cleanup_checkpoint_parts(parts_directory):
 		logger.warning('Checkpoint directory kept because it is not empty after part cleanup: %s', parts_directory)
 
 
-def generate_cable_mapping_for_single_link(ip_1, ip_2, latlon_cluster_and_score_map, category, tree, future_cables, closest_submarine_org, submarine_owners_dict, cable_dict, landing_points_dict, latlon_dict, latlons):
+def generate_cable_mapping_for_single_link(ip_1, ip_2, latlon_cluster_and_score_map, category, tree, future_cables, closest_submarine_org, submarine_owners_dict, cable_dict, landing_points_dict, latlon_dict, latlons, landing_points_by_tree_index=None, landing_point_cables_by_tree_index=None, candidate_cache=None, ip_cluster_cache=None):
 
 	link_all_scores_cable_map = {}
 
-	mean_cluster_1, len_cluster_1 = return_mean_and_len_clusters(ip_1, latlon_cluster_and_score_map)
-	mean_cluster_2, len_cluster_2 = return_mean_and_len_clusters(ip_2, latlon_cluster_and_score_map)
+	mean_cluster_1, len_cluster_1 = get_cached_mean_and_len_clusters(ip_1, latlon_cluster_and_score_map, ip_cluster_cache)
+	mean_cluster_2, len_cluster_2 = get_cached_mean_and_len_clusters(ip_2, latlon_cluster_and_score_map, ip_cluster_cache)
 
 	scores_cable_map = {}
 
 	for mean_cluster_combination, scores_combination in zip(product(mean_cluster_1, mean_cluster_2), product(len_cluster_1, len_cluster_2)):
-		cables = get_cable_for_given_latlon_pair(mean_cluster_combination, tree, scores_combination, future_cables, landing_points_dict, latlon_dict, latlons, category)
-		scores_cable_map = update_dict(scores_cable_map, cables)
+		cables = get_cable_for_given_latlon_pair(
+		 mean_cluster_combination, tree, scores_combination, future_cables,
+		 landing_points_dict, latlon_dict, latlons, category,
+		 cable_dict=cable_dict,
+		 landing_points_by_tree_index=landing_points_by_tree_index,
+		 landing_point_cables_by_tree_index=landing_point_cables_by_tree_index,
+		 candidate_cache=candidate_cache,
+		)
+		for cable, cable_scores in cables.items():
+			scores_cable_map.setdefault(cable, []).extend(cable_scores)
 
 	org_1 = closest_submarine_org.get(ip_1, None)
 	org_2 = closest_submarine_org.get(ip_2, None)
 
-	org_1_cables_names, org_2_cables_names = [], []
+	org_1_cables_names, org_2_cables_names = set(), set()
 
 	if org_1 or org_2:
 		org_1_cables, org_2_cables = [], []
@@ -229,13 +342,13 @@ def generate_cable_mapping_for_single_link(ip_1, ip_2, latlon_cluster_and_score_
 			for org in org_1:
 				org_1_cables.extend(submarine_owners_dict[org])
 			for cable in org_1_cables:
-				org_1_cables_names.append(cable_dict[cable].name)
+				org_1_cables_names.add(cable_dict[cable].name)
 
 		if org_2:
 			for org in org_2:
 				org_2_cables.extend(submarine_owners_dict[org])
 			for cable in org_2_cables:
-				org_2_cables_names.append(cable_dict[cable].name)
+				org_2_cables_names.add(cable_dict[cable].name)
 
 	if len(scores_cable_map) > 0:
 		for cable, geolocation_tuples in scores_cable_map.items():
@@ -255,15 +368,19 @@ def generate_cable_mapping_for_single_link(ip_1, ip_2, latlon_cluster_and_score_
 	return link_all_scores_cable_map
 
 
-def generate_cable_mapping_for_given_category (category_links, latlon_cluster_and_score_map, category, tree, future_cables, closest_submarine_org, submarine_owners_dict, cable_dict, landing_points_dict, latlon_dict, latlons, save_file = None, resume=True, checkpoint_interval=50000, progress_interval=5000, cleanup_checkpoints=True):
+def generate_cable_mapping_for_given_category (category_links, latlon_cluster_and_score_map, category, tree, future_cables, closest_submarine_org, submarine_owners_dict, cable_dict, landing_points_dict, latlon_dict, latlons, save_file = None, resume=True, checkpoint_interval=50000, progress_interval=5000, cleanup_checkpoints=True, mapping_workers=1):
 
 	save_directory = output_path('mapping_outputs')
 	save_directory.mkdir(parents=True, exist_ok=True)
+	landing_points_by_tree_index, landing_point_cables_by_tree_index = prepare_landing_point_lookup(landing_points_dict, latlon_dict, latlons)
+	candidate_cache = {}
+	ip_cluster_cache = {}
 
 	if checkpoint_interval is None or checkpoint_interval <= 0:
 		checkpoint_interval = len(category_links) if len(category_links) > 0 else 1
 	if progress_interval is None or progress_interval <= 0:
 		progress_interval = 5000
+	mapping_workers = max(1, int(mapping_workers or 1))
 
 	final_file = save_directory / save_file
 	parts_directory = save_directory / 'checkpoints' / save_file
@@ -277,6 +394,7 @@ def generate_cable_mapping_for_given_category (category_links, latlon_cluster_an
 		logger.info('Resuming: existing output %s is incomplete for current input; rebuilding from checkpoints', final_file)
 
 	cable_mapping = {}
+	pending_chunks = []
 
 	for chunk_start in range(0, len(category_links), checkpoint_interval):
 		chunk_end = min(chunk_start + checkpoint_interval, len(category_links))
@@ -292,12 +410,20 @@ def generate_cable_mapping_for_given_category (category_links, latlon_cluster_an
 				continue
 			logger.info('Resuming: checkpoint %s is incomplete for current input; recalculating this part', part_file)
 
+		if mapping_workers and mapping_workers > 1:
+			pending_chunks.append((chunk_start, chunk_end, part_file))
+			continue
+
 		part_mapping = {}
 		for count, (ip_1, ip_2) in enumerate(category_links[chunk_start:chunk_end], start=chunk_start):
 			part_mapping[(ip_1, ip_2)] = generate_cable_mapping_for_single_link(
 			 ip_1, ip_2, latlon_cluster_and_score_map, category, tree, future_cables,
 			 closest_submarine_org, submarine_owners_dict, cable_dict, landing_points_dict,
 			 latlon_dict, latlons,
+			 landing_points_by_tree_index=landing_points_by_tree_index,
+			 landing_point_cables_by_tree_index=landing_point_cables_by_tree_index,
+			 candidate_cache=candidate_cache,
+			 ip_cluster_cache=ip_cluster_cache,
 			)
 
 			processed = count + 1
@@ -307,8 +433,53 @@ def generate_cable_mapping_for_given_category (category_links, latlon_cluster_an
 		save_checkpoint_part(part_mapping, part_file)
 		cable_mapping.update(part_mapping)
 
+	if pending_chunks:
+		logger.info('Processing %d checkpoint chunks for %s with %d workers', len(pending_chunks), category, mapping_workers)
+		completed_parallel_chunks = []
+		with ProcessPoolExecutor(
+		 max_workers=mapping_workers,
+		 initializer=_init_cable_mapping_worker,
+		 initargs=(
+		  latlon_cluster_and_score_map,
+		  category,
+		  tree,
+		  future_cables,
+		  closest_submarine_org,
+		  submarine_owners_dict,
+		  cable_dict,
+		  landing_points_dict,
+		  latlon_dict,
+		  latlons,
+		 ),
+		) as executor:
+			futures = {
+			 executor.submit(
+			  _generate_cable_mapping_part_worker,
+			  chunk_start,
+			  category_links[chunk_start:chunk_end],
+			  str(part_file),
+			 ): (chunk_start, chunk_end, part_file)
+			 for chunk_start, chunk_end, part_file in pending_chunks
+			}
+			for future in as_completed(futures):
+				chunk_start, chunk_end, part_file = futures[future]
+				_, completed_part_file, part_len = future.result()
+				expected_len = chunk_end - chunk_start
+				if part_len != expected_len:
+					raise ValueError(f'Checkpoint {completed_part_file} has {part_len} links, expected {expected_len}')
+				completed_parallel_chunks.append((chunk_start, chunk_end, part_file, part_len))
+				logger.info('Finished parallel checkpoint %s with %d links', part_file, part_len)
+
+		for chunk_start, chunk_end, part_file, part_len in sorted(completed_parallel_chunks, key=lambda item: item[0]):
+			expected_len = chunk_end - chunk_start
+			loaded, part_mapping = try_load_pickle_file(part_file)
+			if not loaded or len(part_mapping) != expected_len:
+				raise ValueError(f'Could not validate checkpoint part {part_file}')
+			cable_mapping.update(part_mapping)
+			logger.info('Merged parallel checkpoint %s; accumulated %d of %d', part_file, len(cable_mapping), len(category_links))
+
 	save_results_to_file(cable_mapping, str(save_directory), save_file)
-	if cleanup_checkpoints and is_complete_mapping_file(final_file, len(category_links)):
+	if cleanup_checkpoints and len(cable_mapping) == len(category_links):
 		cleanup_checkpoint_parts(parts_directory)
 	elif cleanup_checkpoints:
 		logger.warning('Keeping checkpoint directory because complete output validation failed: %s', final_file)
@@ -317,7 +488,7 @@ def generate_cable_mapping_for_given_category (category_links, latlon_cluster_an
 
 
 
-def general_cable_mapping_helper (categories_map, latlon_cluster_and_score_map, tree, future_cables, closest_submarine_org, submarine_owners_dict, cable_dict, landing_points_dict, latlon_dict, latlons, max_links_to_process=None, server_id=None, mode=0, ip_version=4, resume=True, checkpoint_interval=50000, progress_interval=5000, cleanup_checkpoints=True):
+def general_cable_mapping_helper (categories_map, latlon_cluster_and_score_map, tree, future_cables, closest_submarine_org, submarine_owners_dict, cable_dict, landing_points_dict, latlon_dict, latlons, max_links_to_process=None, server_id=None, mode=0, ip_version=4, resume=True, checkpoint_interval=50000, progress_interval=5000, cleanup_checkpoints=True, mapping_workers=1):
 
 	cable_mapping_all_categories = {} 
 
@@ -340,14 +511,14 @@ def general_cable_mapping_helper (categories_map, latlon_cluster_and_score_map, 
 				if server_id:
 					save_file += '_s{}'.format(server_id)
 
-				cable_mapping = generate_cable_mapping_for_given_category(category_links, latlon_cluster_and_score_map, category, tree, future_cables, closest_submarine_org, submarine_owners_dict, cable_dict, landing_points_dict, latlon_dict, latlons, save_file, resume=resume, checkpoint_interval=checkpoint_interval, progress_interval=progress_interval, cleanup_checkpoints=cleanup_checkpoints)
+				cable_mapping = generate_cable_mapping_for_given_category(category_links, latlon_cluster_and_score_map, category, tree, future_cables, closest_submarine_org, submarine_owners_dict, cable_dict, landing_points_dict, latlon_dict, latlons, save_file, resume=resume, checkpoint_interval=checkpoint_interval, progress_interval=progress_interval, cleanup_checkpoints=cleanup_checkpoints, mapping_workers=mapping_workers)
 
 			else:
 				save_file = 'cable_mapping_sol_validated_{}_v{}'.format(category, ip_version)
 				if server_id:
 					save_file += '_s{}'.format(server_id)
 
-				cable_mapping = generate_cable_mapping_for_given_category(category_links, latlon_cluster_and_score_map, category, tree, future_cables, closest_submarine_org, submarine_owners_dict, cable_dict, landing_points_dict, latlon_dict, latlons, save_file, resume=resume, checkpoint_interval=checkpoint_interval, progress_interval=progress_interval, cleanup_checkpoints=cleanup_checkpoints)
+				cable_mapping = generate_cable_mapping_for_given_category(category_links, latlon_cluster_and_score_map, category, tree, future_cables, closest_submarine_org, submarine_owners_dict, cable_dict, landing_points_dict, latlon_dict, latlons, save_file, resume=resume, checkpoint_interval=checkpoint_interval, progress_interval=progress_interval, cleanup_checkpoints=cleanup_checkpoints, mapping_workers=mapping_workers)
 
 			cable_mapping_all_categories[category] = cable_mapping
 
@@ -355,13 +526,13 @@ def general_cable_mapping_helper (categories_map, latlon_cluster_and_score_map, 
 
 
 
-def generate_cable_mapping (max_links_to_process=None, max_links_to_process_sol_validated=None, server_id=None, mode=2, ip_version=4, sol_threshold=0.01, geolocation_threshold=0.6, ignore=True, source_mode='ripe_only', geo_source_mode='maxmind_only', use_owner_score=True, resume=True, checkpoint_interval=50000, progress_interval=5000, cleanup_checkpoints=True):
+def generate_cable_mapping (max_links_to_process=None, max_links_to_process_sol_validated=None, server_id=None, mode=2, ip_version=4, sol_threshold=0.01, geolocation_threshold=0.6, ignore=True, source_mode='ripe_only', geo_source_mode='maxmind_only', use_owner_score=True, resume=True, checkpoint_interval=50000, progress_interval=5000, cleanup_checkpoints=True, mapping_workers=1):
 
 	links, all_ips = load_all_links_and_ips_data(ip_version=ip_version, source_mode=source_mode)
 	geolocation_latlon_cluster_and_score_map, geolocation_latlon_cluster_and_score_map_sol_validated, categories_map, categories_map_sol_validated = load_required_files (all_ips, links, mode=mode, ip_version=ip_version, sol_threshold=sol_threshold, geolocation_threshold=geolocation_threshold, ignore=ignore, geo_source_mode=geo_source_mode)
 
 	cable_dict = get_cable_details()
-	future_cables = get_future_cables(cable_dict)
+	future_cables = set(get_future_cables(cable_dict))
 	submarine_owners_dict = get_submarine_owners()
 	landing_points_dict, latlon_dict, latlons, tree = get_all_latlon_locations_ball_tree()
 
@@ -381,7 +552,8 @@ def generate_cable_mapping (max_links_to_process=None, max_links_to_process_sol_
 		            max_links_to_process=max_links_to_process, server_id=server_id,
 		            mode=0, ip_version=ip_version, resume=resume,
 		            checkpoint_interval=checkpoint_interval, progress_interval=progress_interval,
-		            cleanup_checkpoints=cleanup_checkpoints)
+		            cleanup_checkpoints=cleanup_checkpoints,
+		            mapping_workers=mapping_workers)
 
 	if mode in [1, 2]:
 		logger.info('Currently processing mode: %s', mode)
@@ -391,7 +563,8 @@ def generate_cable_mapping (max_links_to_process=None, max_links_to_process_sol_
 		                max_links_to_process=max_links_to_process_sol_validated, server_id=server_id,
 		                mode=1, ip_version=ip_version, resume=resume,
 		                checkpoint_interval=checkpoint_interval, progress_interval=progress_interval,
-		                cleanup_checkpoints=cleanup_checkpoints)
+		                cleanup_checkpoints=cleanup_checkpoints,
+		                mapping_workers=mapping_workers)
 
 	return cable_mapping, cable_mapping_sol_validated
 
@@ -403,7 +576,7 @@ def generate_cable_mapping_test(mode=2, ip_version=4, sol_threshold=0.01, geoloc
 	geolocation_latlon_cluster_and_score_map, geolocation_latlon_cluster_and_score_map_sol_validated, categories_map, categories_map_sol_validated = load_required_files (all_ips, links, mode=mode, ip_version=ip_version, sol_threshold=sol_threshold, geolocation_threshold=geolocation_threshold, ignore=ignore, geo_source_mode=geo_source_mode)
 
 	cable_dict = get_cable_details()
-	future_cables = get_future_cables(cable_dict)
+	future_cables = set(get_future_cables(cable_dict))
 	submarine_owners_dict = get_submarine_owners()
 	landing_points_dict, latlon_dict, latlons, tree = get_all_latlon_locations_ball_tree()
 
@@ -492,13 +665,31 @@ def load_cable_to_lp_ids ():
 
 
 
-def get_landing_point_id_from_landing_points_list (landing_points_list, reverse_landing_points_dict):
+def prepare_cable_to_lp_id_sets(cable_to_lp_ids):
+	return {
+	 cable: [frozenset(item) for item in connected_points]
+	 for cable, connected_points in cable_to_lp_ids.items()
+	}
+
+
+def get_landing_point_id_from_landing_points_list (landing_points_list, reverse_landing_points_dict, landing_point_id_cache=None):
+
+	cache_key = None
+	if landing_point_id_cache is not None:
+		cache_key = tuple(landing_point._replace(cable=tuple(landing_point.cable)) for landing_point in landing_points_list)
+		cached = landing_point_id_cache.get(cache_key)
+		if cached is not None:
+			return cached
 
 	landing_points_ids = []
 	for landing_point in landing_points_list:
 		landing_points_id = reverse_landing_points_dict.get(landing_point._replace(cable=tuple(landing_point.cable)), '')
 		landing_points_ids.append(landing_points_id)
-	return tuple(landing_points_ids)
+
+	result = tuple(landing_points_ids)
+	if landing_point_id_cache is not None:
+		landing_point_id_cache[cache_key] = result
+	return result
 
 
 
@@ -536,7 +727,17 @@ def assign_overall_score (score_tuple, weight_tuple, category):
 
 
 
-def select_cables_for_given_link (link, scores_and_cables, weight_tuple, de_te_additions, cable_to_lp_ids, category, reverse_landing_points_dict,threshold=0.05):
+def _get_cached_lp_id_set(lp_id, lp_id_set_cache=None):
+	if lp_id_set_cache is None:
+		return set(lp_id)
+	cached = lp_id_set_cache.get(lp_id)
+	if cached is None:
+		cached = frozenset(lp_id)
+		lp_id_set_cache[lp_id] = cached
+	return cached
+
+
+def select_cables_for_given_link (link, scores_and_cables, weight_tuple, de_te_additions, cable_to_lp_ids, category, reverse_landing_points_dict,threshold=0.05, cable_to_lp_id_sets=None, landing_point_id_cache=None, lp_id_set_cache=None):
 
 	ret_dict = {}
 
@@ -553,11 +754,16 @@ def select_cables_for_given_link (link, scores_and_cables, weight_tuple, de_te_a
 			score_for_tuple = assign_overall_score(score_tuple, weight_tuple, category)
 			res = True
 			if score_for_tuple:
-				lp_id = get_landing_point_id_from_landing_points_list(score_for_tuple[0], reverse_landing_points_dict)
+				lp_id = get_landing_point_id_from_landing_points_list(score_for_tuple[0], reverse_landing_points_dict, landing_point_id_cache)
 				try:
-					cable_connected_points = cable_to_lp_ids[cable]
+					lp_id_set = _get_cached_lp_id_set(lp_id, lp_id_set_cache)
 					# Check to see if both the landing points are connected
-					res = any(len(set(lp_id) & set(item)) == 2 for item in cable_connected_points)
+					if cable_to_lp_id_sets is not None:
+						cable_connected_points = cable_to_lp_id_sets[cable]
+						res = any(len(lp_id_set & connected_points) == 2 for connected_points in cable_connected_points)
+					else:
+						cable_connected_points = cable_to_lp_ids[cable]
+						res = any(len(lp_id_set & set(item)) == 2 for item in cable_connected_points)
 				except:
 					pass 
 				if res:
@@ -583,12 +789,22 @@ def select_cables_for_given_link (link, scores_and_cables, weight_tuple, de_te_a
 def generate_final_mapping_helper (cable_mapping, de_te_additions, cable_to_lp_ids, reverse_landing_points_dict, threshold=0.05):
 
 	link_to_cable_and_score_mapping = {}
+	cable_to_lp_id_sets = prepare_cable_to_lp_id_sets(cable_to_lp_ids)
+	landing_point_id_cache = {}
+	lp_id_set_cache = {}
 
 	for category, category_cable_mapping in cable_mapping.items():
 		print (f'Currenlty processing {category}')
 		for count, (link, scores_and_cables) in enumerate(category_cable_mapping.items()):
 		 # Getting the scores dict
-			cables, de_te_added = select_cables_for_given_link(link, scores_and_cables, (0.5, 0.4, 0.1), de_te_additions, cable_to_lp_ids, category, reverse_landing_points_dict, threshold=threshold)
+			cables, de_te_added = select_cables_for_given_link(
+			 link, scores_and_cables, (0.5, 0.4, 0.1), de_te_additions,
+			 cable_to_lp_ids, category, reverse_landing_points_dict,
+			 threshold=threshold,
+			 cable_to_lp_id_sets=cable_to_lp_id_sets,
+			 landing_point_id_cache=landing_point_id_cache,
+			 lp_id_set_cache=lp_id_set_cache,
+			)
 
 			if len(cables) > 0:
 			 # Earlier we selected all cables where each landing point was within 0.05 of that particular cable's max value

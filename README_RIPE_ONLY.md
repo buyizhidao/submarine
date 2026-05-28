@@ -50,6 +50,11 @@ RIPE 下载脚本默认启用断点继续。它会在 `../data/intermediate/ripe
 `ripe_resume_state_*` 和 `ripe_resume_checkpoint_*`；使用相同参数重新运行时，
 会从下一个未完成分片继续。使用 `--no-resume` 可以忽略已保存状态并从头重建。
 
+RIPE 获取命令的参数没有变化。当前脚本会在内部对 `--measurements` 中的测量 ID
+使用最多 2 个线程并发处理，例如 `5051` 和 `5151` 会同时运行；不需要额外添加参数。
+普通 RIPE-only 路径会流式处理 traceroute，并按 chunk 保存较小的
+`ripe_chunk_links_*` 分片，最终仍写出原来的 `uniq_ip_dict_*` 文件供后续 mapping 使用。
+
 在 mapping 过程中自动生成 `links_v4` 和 `all_ips_v4`，或通过 `utils.traceroute_utils.load_all_links_and_ips_data(source_mode="ripe_only")` 显式生成。
 
 在 `all_ips_v4` 存在后生成 GeoIP 输出：
@@ -85,6 +90,7 @@ python scripts\run_mapping_mode0.py --ip-version 4
 - `--max-links`：烟雾测试参数，限制每个类别最多处理多少条 link。正式运行不要使用它。
 - `--no-resume`：关闭断点继续，忽略已完成类别文件和 checkpoint 分片，重新计算映射阶段。
 - `--checkpoint-links`：每个 checkpoint 分片包含的 link 数量，默认 `50000`。
+- `--mapping-workers`：mapping 阶段用于处理 checkpoint 分片的 worker 进程数，默认 `1`，表示保持串行执行；设置为大于 `1` 时启用多进程并行。
 - `--progress-interval`：终端和日志中每处理多少条 link 输出一次进度，默认 `5000`。
 - `--log-dir`：运行日志目录，默认 `../logs`。
 - `--log-level`：日志级别，默认 `INFO`。可选值包括 `DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL`。
@@ -116,6 +122,16 @@ python scripts\run_mapping_mode0.py --ip-version 4 --skip-geoip
 ```powershell
 python scripts\run_mapping_mode0.py --ip-version 4 --skip-geoip --checkpoint-links 10000
 ```
+
+如果希望 mapping 阶段并行处理 checkpoint 分片，可以设置 worker 数：
+
+```powershell
+python scripts\run_mapping_mode0.py --ip-version 4 --skip-geoip --mapping-workers 4
+```
+
+并行模式仍使用原来的 checkpoint 文件和最终输出文件名。Windows 下每个 worker
+都会加载一份较大的 mapping 数据，建议先从 `--mapping-workers 2` 或 `4` 开始，
+根据内存占用再调整。默认不加该参数时行为不变。
 
 做烟雾测试时可限制每类数量：
 

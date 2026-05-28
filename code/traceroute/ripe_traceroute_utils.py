@@ -11,6 +11,7 @@ import pickle
 import json
 
 from collections import namedtuple
+from functools import lru_cache
 
 from pathlib import Path
 
@@ -55,7 +56,39 @@ def _resume_checkpoint_file(save_directory, msm_id, ip_version, start_time, end_
 	 _time_slug(end_time),
 	)
 
-def _parse_ripe_atlas_response(response):
+
+def _raw_output_file(save_directory, msm_id, start_time, end_time):
+	start_time_int = int(calendar.timegm(start_time.timetuple()))
+	end_time_int = int(calendar.timegm(end_time.timetuple()))
+	current_process_time = datetime.fromtimestamp(start_time_int, tz=timezone.utc).strftime("%m_%d_%Y_%H_%M")
+	current_process_end_time = datetime.fromtimestamp(end_time_int, tz=timezone.utc).strftime("%m_%d_%Y_%H_%M")
+	file_name = 'raw_output_' + msm_id + '_' + current_process_time + '_to_' + current_process_end_time
+	return save_directory / file_name
+
+
+def _chunk_links_file(save_directory, msm_id, ip_version, start_time, end_time):
+	return save_directory / 'ripe_chunk_links_{}_v{}_{}_to_{}'.format(
+	 msm_id,
+	 ip_version,
+	 _time_slug(start_time),
+	 _time_slug(end_time),
+	)
+
+
+def _ripe_atlas_url_and_params(start_time, end_time, msm_id):
+	fixed_url = "atlas.ripe.net/api/v2/measurements/"
+	start_time_int = int(calendar.timegm(start_time.timetuple()))
+	end_time_int = int(calendar.timegm(end_time.timetuple()))
+	url = "https://{0}{1}/results/".format(fixed_url, msm_id)
+	params = {
+	 'start': start_time_int,
+	 'stop': end_time_int,
+	 'format': 'txt',
+	}
+	return url, params
+
+
+def _iter_ripe_atlas_response(response):
 	"""
 	RIPE Atlas can stream large result sets. Prefer format=txt, where each line is
 	one JSON object, but keep support for the JSON array format for cached/older
@@ -63,7 +96,6 @@ def _parse_ripe_atlas_response(response):
 	"""
 	response.raise_for_status()
 
-	parsed_results = []
 	array_payload = []
 
 	for line in response.iter_lines(decode_unicode=True):
@@ -80,7 +112,7 @@ def _parse_ripe_atlas_response(response):
 			continue
 
 		try:
-			parsed_results.append(json.loads(line))
+			yield json.loads(line)
 		except json.JSONDecodeError as exc:
 			raise ValueError(
 			 'Failed to parse RIPE Atlas result line as JSON. '
@@ -91,7 +123,8 @@ def _parse_ripe_atlas_response(response):
 	if array_payload:
 		payload = ''.join(array_payload)
 		try:
-			return json.loads(payload)
+			for item in json.loads(payload):
+				yield item
 		except json.JSONDecodeError as exc:
 			raise ValueError(
 			 'Failed to parse RIPE Atlas JSON array response. '
@@ -99,7 +132,62 @@ def _parse_ripe_atlas_response(response):
 			 f'Payload length: {len(payload)}'
 			) from exc
 
-	return parsed_results
+
+def _parse_ripe_atlas_response(response):
+	return list(_iter_ripe_atlas_response(response))
+
+
+def _iter_ripe_traceroutes_for_window(start_time, end_time, msm_id):
+	save_directory = output_path('ripe_data')
+	save_directory.mkdir(parents=True, exist_ok=True)
+	raw_file = _raw_output_file(save_directory, msm_id, start_time, end_time)
+
+	if raw_file.exists():
+		logger.info('Directly streaming contents from stored RIPE raw file: %s', raw_file)
+		with open(raw_file, 'rb') as fp:
+			for traceroute in pickle.load(fp):
+				yield traceroute
+		return
+
+	logger.info('Streaming RIPE traceroutes from Atlas for %s to %s', start_time, end_time)
+	url, params = _ripe_atlas_url_and_params(start_time, end_time, msm_id)
+	with requests.get(url, params=params, stream=True, timeout=(15, 180)) as response:
+		yield from _iter_ripe_atlas_response(response)
+
+
+def _transform_single_traceroute(traceroute):
+	hops = {0: [Hops(0, traceroute['src_addr'], 0)]}
+	for hop in traceroute['result']:
+		ips_to_rtts = []
+		hop_num = hop['hop']
+		for i in hop['result']:
+			rtt = i.get('rtt', None)
+			ip = i.get('from', None)
+			if ip and rtt:
+				ips_to_rtts.append(Hops(hop_num, ip, rtt))
+		if len(ips_to_rtts) > 0:
+			hops[hop_num] = ips_to_rtts
+			last_rtt = rtt
+	hops[256] = [Hops(256, traceroute['dst_addr'], last_rtt)]
+	return TraceRoute(hops, {'time': datetime.fromtimestamp(traceroute['timestamp']), 'probe_id': traceroute['prb_id']})
+
+
+def _merge_link_latency_dict(target, source):
+	for link, latencies in source.items():
+		current = target.get(link, [])
+		current.extend(latencies)
+		target[link] = current
+
+
+def _update_link_latencies_from_traceroute(target, traceroute, v4):
+	ripe_hops, _, _ = get_ripe_hops(traceroute, v4)
+	for a_ripe_hop in ripe_hops:
+		ip_addresses = a_ripe_hop[0]
+		all_latencies = target.get(ip_addresses, [])
+		all_min_latencies = a_ripe_hop[1]
+		latency_min = round((all_min_latencies[1] - all_min_latencies[0]) / 2, 2)
+		all_latencies.append(latency_min)
+		target[ip_addresses] = all_latencies
 
 
 def download_data_from_ripe_atlas (start_time, end_time, msm_id, return_content = 0):
@@ -184,20 +272,7 @@ def process_transform_traceroute (traceroute_data, save_file, return_content = 0
 	else:
 		for traceroute in traceroute_data:
 			try:
-				hops = {0: [Hops(0, traceroute['src_addr'], 0)]}
-				for hop in traceroute['result']:
-					ips_to_rtts = []
-					hop_num = hop['hop']
-					for i in hop['result']:
-						rtt = i.get('rtt', None)
-						ip = i.get('from', None)
-						if ip and rtt:
-							ips_to_rtts.append(Hops(hop_num, ip, rtt))
-					if len(ips_to_rtts) > 0:
-						hops[hop_num] = ips_to_rtts
-						last_rtt = rtt
-				hops[256] = [Hops(256, traceroute['dst_addr'], last_rtt)]
-				output_traceroute.append(TraceRoute(hops, {'time' : datetime.fromtimestamp(traceroute['timestamp']), 'probe_id': traceroute['prb_id']}))
+				output_traceroute.append(_transform_single_traceroute(traceroute))
 			except:
 				skipped_traceoute.append(traceroute)
    
@@ -216,6 +291,7 @@ def process_transform_traceroute (traceroute_data, save_file, return_content = 0
 
 
 
+@lru_cache(maxsize=200000)
 def check_if_ip_is_private (ip, v4=True):
  
 	"""
@@ -355,6 +431,145 @@ def get_ripe_hops (traceroute, v4=True):
 	return return_hops, actual_count, conditional_count
 
 
+def _normalize_completed_chunk_files(completed_chunks):
+	chunk_files = []
+	for item in completed_chunks:
+		if isinstance(item, dict):
+			chunk_file = item.get('file')
+		else:
+			chunk_file = item
+		if chunk_file:
+			chunk_files.append(str(chunk_file))
+	return chunk_files
+
+
+def _ripe_process_traceroutes_fast(start_time, end_time, msm_id, ip_version, chunk_hours=2, resume=True):
+	save_directory = output_path('ripe_data')
+	save_directory.mkdir(parents=True, exist_ok=True)
+	state_file = _resume_state_file(save_directory, msm_id, ip_version, start_time, end_time)
+	checkpoint_file = _resume_checkpoint_file(save_directory, msm_id, ip_version, start_time, end_time)
+
+	v4 = ip_version == 4
+	time = start_time
+	d = {}
+	count = 0
+	completed_chunks = []
+	legacy_checkpoint = None
+
+	if resume and state_file.exists():
+		with open(state_file, 'rb') as fp:
+			state = pickle.load(fp)
+
+		if state.get('completed') and Path(state.get('final_file', '')).exists():
+			logger.info('RIPE measurement %s already completed for this window; loading %s', msm_id, state['final_file'])
+			with open(state['final_file'], 'rb') as fp:
+				return pickle.load(fp)
+
+		if state.get('checkpoint_mode') == 'chunk_delta':
+			completed_chunks = _normalize_completed_chunk_files(state.get('completed_chunks', []))
+			logger.info('Resuming RIPE measurement %s from %d completed chunk deltas', msm_id, len(completed_chunks))
+			for chunk_file in completed_chunks:
+				chunk_path = Path(chunk_file)
+				if not chunk_path.exists():
+					raise FileNotFoundError(f'Missing RIPE chunk checkpoint: {chunk_path}')
+				with open(chunk_path, 'rb') as fp:
+					_merge_link_latency_dict(d, pickle.load(fp))
+			time = state.get('next_time', start_time)
+			count = state.get('count', len(completed_chunks))
+		else:
+			legacy_checkpoint = state.get('checkpoint_file')
+		if legacy_checkpoint and Path(legacy_checkpoint).exists():
+			logger.info('Resuming RIPE measurement %s from legacy checkpoint at %s', msm_id, state['next_time'])
+			with open(legacy_checkpoint, 'rb') as fp:
+				d = pickle.load(fp)
+			time = state['next_time']
+			count = state['count']
+
+	while time < end_time:
+		time_end = min(time + timedelta(hours=chunk_hours), end_time)
+		chunk_file = _chunk_links_file(save_directory, msm_id, ip_version, time, time_end)
+		chunk_file_str = str(chunk_file)
+
+		if resume and chunk_file.exists():
+			logger.info('Resuming: loading RIPE chunk delta %s', chunk_file)
+			with open(chunk_file, 'rb') as fp:
+				chunk_links = pickle.load(fp)
+		else:
+			logger.info('Stage 1/2/3: streaming RIPE chunk %s to %s for measurement %s', time, time_end, msm_id)
+			chunk_links = {}
+			raw_count = 0
+			processed_count = 0
+			skipped_count = 0
+			for raw_traceroute in _iter_ripe_traceroutes_for_window(time, time_end, msm_id):
+				raw_count += 1
+				try:
+					traceroute = _transform_single_traceroute(raw_traceroute)
+				except Exception:
+					skipped_count += 1
+					continue
+				_update_link_latencies_from_traceroute(chunk_links, traceroute, v4)
+				processed_count += 1
+
+			with open(chunk_file, 'wb') as fp:
+				pickle.dump(chunk_links, fp, protocol=pickle.HIGHEST_PROTOCOL)
+
+			logger.info(
+				'Finished RIPE chunk %s to %s: raw=%d processed=%d skipped=%d chunk_links=%d',
+				time,
+				time_end,
+				raw_count,
+				processed_count,
+				skipped_count,
+				len(chunk_links),
+			)
+
+		_merge_link_latency_dict(d, chunk_links)
+		if chunk_file_str not in completed_chunks:
+			completed_chunks.append(chunk_file_str)
+
+		time = time_end
+		count += 1
+		logger.info('Current count is %d and dictionary length is %d', count, len(d))
+
+		with open(state_file, 'wb') as fp:
+			pickle.dump({
+			 'completed': False,
+			 'count': count,
+			 'next_time': time,
+			 'checkpoint_file': chunk_file_str,
+			 'checkpoint_mode': 'chunk_delta',
+			 'completed_chunks': completed_chunks,
+			 'measurement': msm_id,
+			 'ip_version': ip_version,
+			 'chunk_hours': chunk_hours,
+			}, fp, protocol=pickle.HIGHEST_PROTOCOL)
+
+	end_time_int = int(calendar.timegm(end_time.timetuple()))
+	end_process_time = datetime.fromtimestamp(end_time_int, tz=timezone.utc).strftime("%m_%d_%Y_%H_%M")
+
+	logger.info('Finishing RIPE processing, doing the final save')
+	file_name = f'uniq_ip_dict_{msm_id}_all_links_v{ip_version}_min_all_latencies_only_{end_process_time}_count_' + str(count // 6)
+	save_file = save_directory / file_name
+	with open(save_file, 'wb') as fp:
+		pickle.dump(d, fp, protocol=pickle.HIGHEST_PROTOCOL)
+
+	with open(state_file, 'wb') as fp:
+		pickle.dump({
+		 'completed': True,
+		 'count': count,
+		 'next_time': end_time,
+		 'checkpoint_file': completed_chunks[-1] if completed_chunks else str(checkpoint_file),
+		 'checkpoint_mode': 'chunk_delta',
+		 'completed_chunks': completed_chunks,
+		 'final_file': str(save_file),
+		 'measurement': msm_id,
+		 'ip_version': ip_version,
+		 'chunk_hours': chunk_hours,
+		}, fp, protocol=pickle.HIGHEST_PROTOCOL)
+
+	return d
+
+
 def ripe_process_traceroutes (start_time, end_time, msm_id, ip_version, geolocation_validation=False, chunk_hours=2, resume=True):
 
 	"""
@@ -373,6 +588,9 @@ def ripe_process_traceroutes (start_time, end_time, msm_id, ip_version, geolocat
 	state_file = _resume_state_file(save_directory, msm_id, ip_version, start_time, end_time)
 	checkpoint_file = _resume_checkpoint_file(save_directory, msm_id, ip_version, start_time, end_time)
 
+	if not geolocation_validation:
+		return _ripe_process_traceroutes_fast(start_time, end_time, msm_id, ip_version, chunk_hours=chunk_hours, resume=resume)
+
 	time = start_time
 	d = {}
 	count = 0
@@ -380,11 +598,13 @@ def ripe_process_traceroutes (start_time, end_time, msm_id, ip_version, geolocat
 	if resume and state_file.exists():
 		with open(state_file, 'rb') as fp:
 			state = pickle.load(fp)
-		if state.get('completed') and Path(state.get('final_file', '')).exists():
+		if state.get('checkpoint_mode') == 'chunk_delta':
+			logger.info('Ignoring RIPE-only chunk-delta resume state for geolocation validation path')
+		elif state.get('completed') and Path(state.get('final_file', '')).exists():
 			logger.info('RIPE measurement %s already completed for this window; loading %s', msm_id, state['final_file'])
 			with open(state['final_file'], 'rb') as fp:
 				return pickle.load(fp)
-		if Path(state.get('checkpoint_file', '')).exists():
+		elif state.get('checkpoint_file') and Path(state.get('checkpoint_file')).exists():
 			logger.info('Resuming RIPE measurement %s from %s', msm_id, state['next_time'])
 			with open(state['checkpoint_file'], 'rb') as fp:
 				d = pickle.load(fp)

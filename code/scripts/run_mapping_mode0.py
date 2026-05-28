@@ -23,6 +23,7 @@ def parse_args():
 	parser.add_argument('--max-links', type=int, default=None, help='Optional cap per category for smoke tests.')
 	parser.add_argument('--no-resume', action='store_true', help='Ignore complete category outputs and checkpoint parts.')
 	parser.add_argument('--checkpoint-links', type=int, default=50000, help='Number of links per cable-mapping checkpoint part.')
+	parser.add_argument('--mapping-workers', type=int, default=1, help='Number of worker processes for checkpoint chunk cable mapping. Use 1 for serial execution.')
 	parser.add_argument('--progress-interval', type=int, default=5000, help='Print progress every N processed links.')
 	parser.add_argument('--log-dir', default=str(log_path()), help='Directory for automatic run logs.')
 	parser.add_argument('--log-level', default='INFO', help='Logging level: DEBUG, INFO, WARNING, ERROR, or CRITICAL.')
@@ -64,6 +65,7 @@ def run(args):
 	 max_links_to_process=max_links_to_process,
 		resume=not args.no_resume,
 		checkpoint_interval=args.checkpoint_links,
+		mapping_workers=args.mapping_workers,
 		progress_interval=args.progress_interval,
 		cleanup_checkpoints=not args.keep_checkpoints,
 	)

@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -46,6 +47,21 @@ def parse_date(value):
 	)
 
 
+def fetch_measurement(args, start_time, end_time, measurement):
+	logger.info('Fetching RIPE Atlas measurement %s from %s to %s', measurement, args.start, args.end)
+	result = ripe_process_traceroutes(
+	 start_time,
+	 end_time,
+	 str(measurement),
+	 args.ip_version,
+	 False,
+	 chunk_hours=args.chunk_hours,
+	 resume=not args.no_resume,
+	)
+	logger.info('Measurement %s produced %d unique links', measurement, len(result))
+	return measurement, len(result)
+
+
 def main():
 	args = parse_args()
 	configure_logging(Path(__file__).name, args.log_dir, args.log_level)
@@ -57,18 +73,20 @@ def main():
 
 	Path(str(output_path('ripe_data'))).mkdir(parents=True, exist_ok=True)
 
-	for measurement in args.measurements:
-		logger.info('Fetching RIPE Atlas measurement %s from %s to %s', measurement, args.start, args.end)
-		result = ripe_process_traceroutes(
-		 start_time,
-		 end_time,
-		 str(measurement),
-		 args.ip_version,
-		 False,
-		 chunk_hours=args.chunk_hours,
-		 resume=not args.no_resume,
-		)
-		logger.info('Measurement %s produced %d unique links', measurement, len(result))
+	measurements = [str(measurement) for measurement in args.measurements]
+	max_workers = min(2, len(measurements))
+	with ThreadPoolExecutor(max_workers=max_workers) as executor:
+		futures = {
+		 executor.submit(fetch_measurement, args, start_time, end_time, measurement): measurement
+		 for measurement in measurements
+		}
+		for future in as_completed(futures):
+			measurement = futures[future]
+			try:
+				future.result()
+			except Exception:
+				logger.exception('RIPE Atlas measurement %s failed', measurement)
+				raise
 
 
 if __name__ == '__main__':

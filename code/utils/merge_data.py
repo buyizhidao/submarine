@@ -95,9 +95,14 @@ def merge_cable_mapping_results_for_each_category (directory, list_of_files=[], 
 		count = 0
   
 		for file in files:
-			if '{}_{}'.format(category, keywords[0]) in str(file):
+			file_name = file.name
+			regular_prefix = 'cable_mapping_{}_{}'.format(category, keywords[0])
+			sol_prefix = 'cable_mapping_sol_validated_{}_{}'.format(category, keywords[0])
+			if '_merged' in file_name:
+				continue
+			if file_name.startswith(regular_prefix) or file_name.startswith(sol_prefix):
 				logger.info('Currently processing file %s', file)
-				if 'sol_validated' in str(file):
+				if file_name.startswith(sol_prefix):
 					with open(file, 'rb') as fp:
 						content = pickle.load(fp)
 					mapping_sol_validated.update(content)
