@@ -9,7 +9,7 @@
 原始 `requirements.txt` 从 Nautilus 复制而来，固定了过旧版本，无法在 Python 3.12 上安装。请改用兼容的轻量版文件：
 
 ```powershell
-python -m pip install -r ..\requirements-lite.txt
+python -m pip install -r ../requirements-lite.txt
 ```
 
 ## 已准备的数据
@@ -29,7 +29,7 @@ mapping/data/raw/submarine_data
 IPUMSI 兼容的国家边界 shapefile 由以下脚本生成：
 
 ```powershell
-python scripts\prepare_ipumsi_boundaries.py
+python scripts/prepare_ipumsi_boundaries.py
 ```
 
 旧的 IPUMSI zip URL 当前返回 404，因此脚本会回退到官方 IPUMS ArcGIS FeatureServer，并写入：
@@ -43,7 +43,7 @@ python scripts\prepare_ipumsi_boundaries.py
 获取并处理 RIPE Atlas traceroutes：
 
 ```powershell
-python scripts\fetch_ripe_traceroutes.py --start "2026-05-01 00:00" --end "2026-05-02 00:00" --ip-version 4 --measurements 5051 5151 --chunk-hours 0.5
+python scripts/fetch_ripe_traceroutes.py --start "2026-05-01 00:00" --end "2026-05-15 00:00" --ip-version 4 --measurements 5051 5151 --chunk-hours 0.5
 ```
 
 RIPE 下载脚本默认启用断点继续。它会在 `../data/intermediate/ripe_data` 下写入
@@ -60,13 +60,13 @@ RIPE 获取命令的参数没有变化。当前脚本会在内部对 `--measurem
 在 `all_ips_v4` 存在后生成 GeoIP 输出：
 
 ```powershell
-python scripts\generate_geoip_locations.py --ip-version 4
+python scripts/generate_geoip_locations.py --ip-version 4
 ```
 
 运行 mode=0 映射：
 
 ```powershell
-python scripts\run_mapping_mode0.py --ip-version 4
+python scripts/run_mapping_mode0.py --ip-version 4
 ```
 
 `run_mapping_mode0.py` 会自动在 `logs` 目录写入运行日志，同时仍然把输出显示在终端。
@@ -114,19 +114,19 @@ scripts/convert_submarine_processed_to_nautilus_pickles.py
 例如，复用已有 GeoIP 并按默认分片继续运行：
 
 ```powershell
-python scripts\run_mapping_mode0.py --ip-version 4 --skip-geoip
+python scripts/run_mapping_mode0.py --ip-version 4 --skip-geoip
 ```
 
 如果希望更频繁保存 checkpoint，可以调小分片大小：
 
 ```powershell
-python scripts\run_mapping_mode0.py --ip-version 4 --skip-geoip --checkpoint-links 10000
+python scripts/run_mapping_mode0.py --ip-version 4 --skip-geoip --checkpoint-links 10000
 ```
 
 如果希望 mapping 阶段并行处理 checkpoint 分片，可以设置 worker 数：
 
 ```powershell
-python scripts\run_mapping_mode0.py --ip-version 4 --skip-geoip --mapping-workers 4
+python scripts/run_mapping_mode0.py --ip-version 4 --skip-geoip --mapping-workers 4
 ```
 
 并行模式仍使用原来的 checkpoint 文件和最终输出文件名。Windows 下每个 worker
@@ -136,7 +136,7 @@ python scripts\run_mapping_mode0.py --ip-version 4 --skip-geoip --mapping-worker
 做烟雾测试时可限制每类数量：
 
 ```powershell
-python scripts\run_mapping_mode0.py --ip-version 4 --max-links 100
+python scripts/run_mapping_mode0.py --ip-version 4 --max-links 100
 ```
 
 注意：`--max-links` 会写入与正式运行相同的输出文件名，仅用于测试流程是否能跑通。
@@ -147,7 +147,7 @@ python scripts\run_mapping_mode0.py --ip-version 4 --max-links 100
 位于 `mapping/data/raw/submarine/processed` 的新处理 CSV 可在之后转换：
 
 ```powershell
-python scripts\convert_submarine_processed_to_nautilus_pickles.py --processed-dir ..\data\raw\submarine\processed --output-dir ..\data\raw\submarine_data_new
+python scripts/convert_submarine_processed_to_nautilus_pickles.py --processed-dir ../data/raw/submarine/processed --output-dir ../data/raw/submarine_data_new
 ```
 
 在仅 RIPE 流程能正常跑通原始 Nautilus 海底光缆 pickles 之前，不要覆盖 `../data/raw/submarine_data`。
